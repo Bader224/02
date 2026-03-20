@@ -1,0 +1,24 @@
+name: AIBTC Miner
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: npm install
+
+      - name: Mine
+        run: node aibtc.js run 0x507642C6bD421b385A4d8e902d85E2f4BF9126c1 100

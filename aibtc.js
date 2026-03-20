@@ -31,25 +31,26 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function save(s) { try { fs.writeFileSync(CONFIG.statsFile, JSON.stringify(s,null,2)); } catch(_) {} }
 function load() {
     try { return JSON.parse(fs.readFileSync(CONFIG.statsFile,"utf8")); } catch(_) {}
-    return { totalHashes:0, found:0, accepted:0, rejected:0, startTime:null, walletAddress:null };
+    return { totalHashes:0, found:0, accepted:0, rejected:0, startTime:null, wallets:[] };
 }
 function savePid(p) { fs.writeFileSync(CONFIG.pidFile, String(p)); }
 function delPid() { try { fs.unlinkSync(CONFIG.pidFile); } catch(_) {} }
 function getPid() { try { return parseInt(fs.readFileSync(CONFIG.pidFile,"utf8"),10)||null; } catch(_) { return null; } }
 function alive(pid) { try { process.kill(pid,0); return true; } catch(_) { return false; } }
 
-let _b = null;
+let _bufCache = {};
 function genAddr(wallet, seed1, seed2) {
-    if (!_b) {
+    if (!_bufCache[wallet]) {
         const ab = Buffer.from(wallet.toLowerCase(),"utf8");
-        _b = { ab, s1:Buffer.alloc(8), s2:Buffer.alloc(8), cb:Buffer.allocUnsafe(ab.length+16) };
-        ab.copy(_b.cb, 0);
+        _bufCache[wallet] = { ab, s1:Buffer.alloc(8), s2:Buffer.alloc(8), cb:Buffer.allocUnsafe(ab.length+16) };
+        ab.copy(_bufCache[wallet].cb, 0);
     }
-    _b.s1.writeBigInt64BE(BigInt(seed1));
-    _b.s2.writeBigInt64BE(BigInt(seed2));
-    _b.s1.copy(_b.cb, _b.ab.length);
-    _b.s2.copy(_b.cb, _b.ab.length + 8);
-    const hash = crypto.createHash("sha256").update(_b.cb).digest();
+    const b = _bufCache[wallet];
+    b.s1.writeBigInt64BE(BigInt(seed1));
+    b.s2.writeBigInt64BE(BigInt(seed2));
+    b.s1.copy(b.cb, b.ab.length);
+    b.s2.copy(b.cb, b.ab.length + 8);
+    const hash = crypto.createHash("sha256").update(b.cb).digest();
     let pk = BigInt("0x" + hash.toString("hex")) % N;
     if (pk === 0n) pk = 1n;
     const sk = new ethers.SigningKey("0x" + pk.toString(16).padStart(64,"0"));
@@ -84,25 +85,57 @@ async function submit(wallet, seed1, seed2) {
     }
 }
 
-async function mine(wallet, cpu) {
-    if (!ethers.isAddress(wallet)) { log("❌ Invalid wallet!", "red"); process.exit(1); }
+// Submit same proof to ALL wallets in parallel
+async function submitToAll(wallets, seed1, seed2) {
+    log(`📤 Submitting to ${wallets.length} wallets in parallel...`, "blue");
+    const results = await Promise.all(
+        wallets.map(w => submit(w, seed1, seed2).then(r => ({ wallet: w, ...r })))
+    );
+    let acc = 0, rej = 0;
+    for (const r of results) {
+        const short = r.wallet.slice(0, 8) + "..." + r.wallet.slice(-4);
+        if (r.ok) {
+            acc++;
+            log(`  ✅ ${short} → ACCEPTED`, "green");
+        } else {
+            rej++;
+            log(`  ❌ ${short} → ${r.raw}`, "red");
+        }
+    }
+    log(`📊 Batch result: ${acc} accepted / ${rej} rejected`, acc > 0 ? "green" : "red");
+    return { accepted: acc, rejected: rej };
+}
+
+async function mine(wallets, cpu) {
+    // Validate all wallets
+    for (const w of wallets) {
+        if (!ethers.isAddress(w)) {
+            log(`❌ Invalid wallet: ${w}`, "red");
+            process.exit(1);
+        }
+    }
     const ex = getPid();
     if (ex && alive(ex)) { log("⚠️  Already running PID " + ex, "yellow"); process.exit(1); }
     savePid(process.pid);
     CONFIG.SLEEP_MS = calcSleep(cpu);
     const stats = load();
     stats.startTime = Date.now();
-    stats.walletAddress = wallet;
+    stats.wallets = wallets;
     save(stats);
+
+    // Use first wallet as "mining" address for hash generation
+    const miningWallet = wallets[0];
 
     console.log("\n" + C.cyan +
         "╔══════════════════════════════════════════════════════════╗\n" +
-        "║         ⛏️  AIBTC MINER - FULLY FIXED VERSION ⛏️          ║\n" +
+        "║      ⛏️  AIBTC MULTI-WALLET MINER v4.0 ⛏️               ║\n" +
         "╚══════════════════════════════════════════════════════════╝"
     + C.reset + "\n");
-    log("🔷 Wallet  : " + wallet, "blue");
-    log("🔷 CPU     : ~" + cpu + "% (sleep " + CONFIG.SLEEP_MS + "ms per batch)", "blue");
-    log("🔷 Prefix  : address[0..10] contains [" + CONFIG.prefix + "]", "blue");
+    log(`🔷 Wallets  : ${wallets.length} wallets loaded`, "blue");
+    wallets.forEach((w, i) => log(`   [${i+1}] ${w}`, "cyan"));
+    log(`🔷 CPU      : ~${cpu}% (sleep ${CONFIG.SLEEP_MS}ms per batch)`, "blue");
+    log(`🔷 Prefix   : address[0..10] contains [${CONFIG.prefix}]`, "blue");
+    log(`🔷 Strategy : Each found hash → submitted to ALL ${wallets.length} wallets`, "magenta");
     console.log("");
     log("✅ Mining started... Ctrl+C to stop", "green");
     console.log("");
@@ -125,7 +158,8 @@ async function mine(wallet, cpu) {
         console.log("\n" + C.cyan + "📊 Session:" + C.reset);
         console.log("   Hashes   : " + hashes.toLocaleString());
         console.log("   H/s      : " + Math.floor(hashes/secs).toLocaleString());
-        console.log("   Accepted : " + C.green + accepted + C.reset);
+        console.log("   Found    : " + found);
+        console.log("   Accepted : " + C.green + accepted + C.reset + " (across all wallets)");
         console.log("   Rejected : " + C.red + rejected + C.reset + "\n");
         process.exit(0);
     };
@@ -135,7 +169,7 @@ async function mine(wallet, cpu) {
     while (true) {
         const seed1 = Date.now() + Math.floor(Math.random() * 1_000_000);
         for (let seed2 = 0; seed2 <= 2_000_000; seed2++) {
-            const addr   = genAddr(wallet, seed1, seed2);
+            const addr   = genAddr(miningWallet, seed1, seed2);
             const addr40 = addr.slice(2);
             hashes++;
             batch++;
@@ -149,7 +183,7 @@ async function mine(wallet, cpu) {
                     "\r" + C.cyan +
                     "⛏️  " + hashes.toLocaleString() +
                     " | " + Math.floor(hashes/secs).toLocaleString() + " H/s" +
-                    " | CPU ~" + cpu + "%" +
+                    " | Wallets: " + wallets.length +
                     " | Found: " + found +
                     " | " + C.green + "✓" + accepted + C.cyan +
                     " | " + C.red + "✗" + rejected + C.cyan +
@@ -159,18 +193,19 @@ async function mine(wallet, cpu) {
             }
             const check10 = addr40.slice(0, 10);
             if (!check10.includes(CONFIG.prefix)) continue;
+
             found++;
             console.log("");
-            log("🎯 MATCH FOUND!", "green");
-            log("   Address  : " + addr, "yellow");
-            log("   First 10 : " + check10, "yellow");
-            log("   Seed1    : " + seed1, "yellow");
-            log("   Seed2    : " + seed2, "yellow");
-            log("📤 Submitting...", "blue");
-            const r = await submit(wallet, seed1, seed2);
-            log("📨 Server: " + r.raw, r.ok ? "green" : "red");
-            if (r.ok) { accepted++; log("✅ ACCEPTED! (" + accepted + " total)", "green"); }
-            else { rejected++; log("❌ REJECTED (" + rejected + " total)", "red"); }
+            log("🎯 MATCH FOUND! Submitting to all " + wallets.length + " wallets...", "green");
+            log("   Address : " + addr, "yellow");
+            log("   Seed1   : " + seed1, "yellow");
+            log("   Seed2   : " + seed2, "yellow");
+
+            // KEY: submit to ALL wallets!
+            const res = await submitToAll(wallets, seed1, seed2);
+            accepted += res.accepted;
+            rejected += res.rejected;
+
             const s = load();
             s.totalHashes = (s.totalHashes||0) + hashes;
             s.found = (s.found||0) + found;
@@ -196,25 +231,33 @@ function status() {
     console.log("\n" + C.cyan + "📊 AIBTC STATUS\n" + C.reset);
     if (pid && alive(pid)) { log("✅ RUNNING","green"); log("   PID: "+pid,"blue"); }
     else { log("⏹️  STOPPED","yellow"); delPid(); }
-    console.log("   Wallet   : " + (s.walletAddress||"N/A"));
+    console.log("   Wallets  : " + (s.wallets ? s.wallets.length : 0));
     console.log("   Hashes   : " + (s.totalHashes||0).toLocaleString());
+    console.log("   Found    : " + (s.found||0));
     console.log("   Accepted : " + C.green + (s.accepted||0) + C.reset);
     console.log("   Rejected : " + C.red + (s.rejected||0) + C.reset + "\n");
 }
 
-const cmd = process.argv[2];
-const addr = process.argv[3];
-const cpuArg = parseInt(process.argv[4], 10);
-const cpu = (!isNaN(cpuArg) && cpuArg >= 1 && cpuArg <= 100) ? cpuArg : 100;
+const cmd     = process.argv[2];
+const walletsArg = process.argv[3] || "";
+const cpuArg  = parseInt(process.argv[4], 10);
+const cpu     = (!isNaN(cpuArg) && cpuArg >= 1 && cpuArg <= 100) ? cpuArg : 100;
+
+// Support comma-separated wallets: "0xAAA,0xBBB,0xCCC"
+const wallets = walletsArg.split(",").map(w => w.trim()).filter(w => w.length > 0);
 
 switch (cmd) {
     case "run":
-        if (!addr) { console.log("Usage: node aibtc.js run <WALLET> [cpu%]"); process.exit(1); }
-        mine(addr, cpu);
+        if (!wallets.length) {
+            console.log("Usage: node aibtc.js run <WALLET1,WALLET2,...> [cpu%]");
+            console.log("Example: node aibtc.js run 0xAAA,0xBBB,0xCCC 100");
+            process.exit(1);
+        }
+        mine(wallets, cpu);
         break;
     case "stop":   stop();   break;
     case "status": status(); break;
     default:
-        console.log("node aibtc.js run <WALLET> [cpu%]");
+        console.log("node aibtc.js run <WALLET1,WALLET2,...> [cpu%]");
         process.exit(0);
 }
